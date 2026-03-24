@@ -1,0 +1,359 @@
+%% 3D Tumor–CD8 T cell evolution with intrinsic tumor death and evolutionary tradeoff
+clear; clc; close all;
+
+% Grid size
+N = 50;
+
+% Cell state codes
+EMPTY     = int8(0);
+CD8       = int8(1);
+TUM_SENS  = int8(2);
+TUM_RES   = int8(3);
+
+%===============================
+% PARAMETERS (tune these)
+%===============================
+
+% Proliferation extremes for evolutionary tradeoff
+% When CD8 pressure is LOW (kill_sweeps = kill_low):
+p_divide_sens_high = 0.08;   % sensitive clone grows well
+p_divide_res_low   = 0.02;   % resistant clone grows slowly
+
+% When CD8 pressure is HIGH (kill_sweeps = kill_high):
+p_divide_sens_low  = 0.01;   % sensitive clone suppressed
+p_divide_res_high  = 0.08;   % resistant clone thrives
+
+% Mutation and intrinsic death
+p_mut         = 0.10;   % mutation from sensitive -> resistant
+p_death_sens  = 0.02;   % intrinsic death of sensitive tumor cells
+p_death_res   = 0.02;   % intrinsic death of resistant tumor cells
+
+% CD8 killing probabilities (per contact)
+p_kill_sens   = 0.99;   % CD8 killing of sensitive tumor
+p_kill_res    = 0.01;   % CD8 killing of resistant tumor
+
+% CD8 motility and initial number
+p_cd8_move    = 0.10;   % CD8 random movement probability
+n_cd8_init    = 2500;   % initial number of CD8 T cells
+
+% Simulation length
+n_steps       = 500;
+
+% ==== CD8 killing fluctuation: deterministic alternating pattern ====
+% high phase: strong killing (many sweeps)
+% low phase: weak killing (few sweeps)
+kill_high       = 10;     % high number of sweeps
+kill_low        = 5;      % low number of sweeps
+switch_period   = 500;     % steps per phase: 20 high, 20 low, 20 high, ...
+
+kill_sweeps_hist = zeros(n_steps, 1);  % to record kill_sweeps over time
+
+%===============================
+% INITIAL CONDITIONS
+%===============================
+
+% Initialize 3D grid
+grid = zeros(N, N, N, 'int8');
+
+% Seed initial tumor as a small sphere in the centre (all sensitive)
+[xg, yg, zg] = ndgrid(1:N, 1:N, 1:N);
+cx = (N+1)/2; 
+cy = (N+1)/2; 
+cz = (N+1)/2;
+radius = 4;
+
+mask_tumor = (xg - cx).^2 + (yg - cy).^2 + (zg - cz).^2 <= radius^2;
+grid(mask_tumor) = TUM_SENS;
+
+% Seed CD8 T cells randomly in empty space
+n_cd8_init = min(n_cd8_init, nnz(grid == EMPTY));
+empty_idx  = find(grid == EMPTY);
+perm       = randperm(numel(empty_idx), n_cd8_init);
+grid(empty_idx(perm)) = CD8;
+
+% Neighbour directions (6-neighbourhood)
+dirs = [ 1  0  0;
+        -1  0  0;
+         0  1  0;
+         0 -1  0;
+         0  0  1;
+         0  0 -1];
+
+%===============================
+% FIGURE SETUP
+%===============================
+figure('Color', 'w');
+
+subplot(1,2,1);  % left: 3D view
+axis([1 N 1 N 1 N]);
+axis vis3d;
+view(3);
+grid on;
+xlabel('X'); ylabel('Y'); zlabel('Z');
+title('3D Tumor–CD8 T cell Evolution');
+
+subplot(1,2,2);  % right: time series
+xlabel('Time step');
+ylabel('Total tumor cells');
+title('Tumor burden over time');
+grid on;
+drawnow;
+
+tumor_total = zeros(n_steps,1);   % total tumor cells
+sens_hist   = zeros(n_steps,1);   % sensitive tumor cells
+res_hist    = zeros(n_steps,1);   % resistant tumor cells
+
+%===============================
+% MAIN SIMULATION LOOP
+%===============================
+for t = 1:n_steps
+
+    %---------------------------------------
+    % 0) Alternating high/low CD8 killing
+    %---------------------------------------
+    % phase_index: 0,0,...,0,1,1,...,1,2,2,... etc
+    phase_index = floor((t-1) / switch_period);
+
+    % even phases -> high killing, odd phases -> low killing
+if mod(phase_index, 2) == 0
+    base_kill = kill_high;
+else
+    base_kill = kill_low;
+end
+
+% Add stochastic fluctuation around the base value
+kill_noise_sd = 1.5;   % standard deviation of noise
+kill_sweeps_now = round(base_kill + kill_noise_sd * randn);
+
+% Clamp to sensible bounds
+kill_sweeps_now = max(0, min(kill_high + 3, kill_sweeps_now));
+    % record history
+    kill_sweeps_hist(t) = kill_sweeps_now;
+
+    %---------------------------------------
+    % 1) Map kill_sweeps_now -> "immune pressure" in [0,1]
+    %    0 = lowest pressure (kill_low)
+    %    1 = highest pressure (kill_high)
+    %---------------------------------------
+    if kill_high == kill_low
+        pressure = 0.5;   % arbitrary if no fluctuation
+    else
+        pressure = (kill_sweeps_now - kill_low) / (kill_high - kill_low);
+        pressure = max(0, min(1, pressure));   % clamp to [0,1]
+    end
+
+    %---------------------------------------
+    % 2) Interpolate proliferation rates based on pressure
+    %    LOW pressure (0): sens ~ high,  res ~ low
+    %    HIGH pressure (1): sens ~ low,  res ~ high
+    %---------------------------------------
+    p_divide_sens_now = p_divide_sens_low  * pressure + p_divide_sens_high * (1 - pressure);
+    p_divide_res_now  = p_divide_res_low   * (1 - pressure) + p_divide_res_high * pressure;
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% 3) CD8-mediated killing (immune attack FIRST - multi-sweep)
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    if kill_sweeps_now > 0
+        for s = 1:kill_sweeps_now
+            newGrid = grid;
+            [cx_idx, cy_idx, cz_idx] = ind2sub(size(grid), find(grid == CD8));
+
+            for i = 1:numel(cx_idx)
+                x = cx_idx(i); y = cy_idx(i); z = cz_idx(i);
+
+                % loop over all 6 directions
+                for k = 1:size(dirs,1)
+                    nx = x + dirs(k,1);
+                    ny = y + dirs(k,2);
+                    nz = z + dirs(k,3);
+
+                    if nx < 1 || nx > N || ny < 1 || ny > N || nz < 1 || nz > N
+                        continue;
+                    end
+
+                    target = grid(nx, ny, nz);
+
+                    if target == TUM_SENS
+                        if rand < p_kill_sens
+                            newGrid(nx, ny, nz) = EMPTY;
+                        end
+                    elseif target == TUM_RES
+                        if rand < p_kill_res
+                            newGrid(nx, ny, nz) = EMPTY;
+                        end
+                    end
+                end
+            end
+
+            grid = newGrid;  % update after each sweep
+        end
+    end
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% 4) CD8 random movement
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    newGrid = grid;
+    [cx_idx, cy_idx, cz_idx] = ind2sub(size(grid), find(grid == CD8));
+
+    for i = 1:numel(cx_idx)
+        if rand > p_cd8_move
+            continue;
+        end
+
+        x = cx_idx(i); y = cy_idx(i); z = cz_idx(i);
+
+        d  = dirs(randi(size(dirs,1)), :);
+        nx = x + d(1); ny = y + d(2); nz = z + d(3);
+
+        if nx < 1 || nx > N || ny < 1 || ny > N || nz < 1 || nz > N
+            continue;
+        end
+
+        if grid(nx, ny, nz) == EMPTY
+            newGrid(nx, ny, nz) = CD8;
+            newGrid(x, y, z)    = EMPTY;
+        end
+    end
+    grid = newGrid;
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% 5) Intrinsic tumor cell death (they are not immortal)
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    newGrid = grid;
+    [tx, ty, tz] = ind2sub(size(grid), find(grid == TUM_SENS | grid == TUM_RES));
+
+    for i = 1:numel(tx)
+        x = tx(i); y = ty(i); z = tz(i);
+        state = grid(x, y, z);
+
+        if state == TUM_SENS
+            if rand < p_death_sens
+                newGrid(x, y, z) = EMPTY;
+            end
+        elseif state == TUM_RES
+            if rand < p_death_res
+                newGrid(x, y, z) = EMPTY;
+            end
+        end
+    end
+    grid = newGrid;
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% 6) Tumor proliferation (with evolutionary tradeoff)
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    newGrid = grid;
+    [tx, ty, tz] = ind2sub(size(grid), find(grid == TUM_SENS | grid == TUM_RES));
+
+    for i = 1:numel(tx)
+        x = tx(i); y = ty(i); z = tz(i);
+        state = grid(x, y, z);
+
+        % Pick proliferation probability depending on clone identity
+        if state == TUM_SENS
+            p_divide_current = p_divide_sens_now;
+        else  % TUM_RES
+            p_divide_current = p_divide_res_now;
+        end
+
+        % Decide if this cell divides
+        if rand > p_divide_current
+            continue;
+        end
+
+        % Choose random neighbour for daughter cell
+        d  = dirs(randi(size(dirs,1)), :);
+        nx = x + d(1); ny = y + d(2); nz = z + d(3);
+
+        if nx < 1 || nx > N || ny < 1 || ny > N || nz < 1 || nz > N
+            continue;
+        end
+
+        if newGrid(nx, ny, nz) == EMPTY
+            parent_state   = state;
+            daughter_state = parent_state;
+
+            % Mutation from sensitive to resistant
+            if parent_state == TUM_SENS && rand < p_mut
+                daughter_state = TUM_RES;
+            end
+
+            newGrid(nx, ny, nz) = daughter_state;
+        end
+    end
+
+    grid = newGrid;
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% 7) Bookkeeping & possible extinction check
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    n_sens = nnz(grid == TUM_SENS);
+n_res  = nnz(grid == TUM_RES);
+n_cd8  = nnz(grid == CD8);
+
+tumor_total(t) = n_sens + n_res;
+sens_hist(t)   = n_sens;
+res_hist(t)    = n_res;
+
+    if mod(t, 10) == 0
+        fprintf('Step %3d: sens=%5d, res=%5d, CD8=%5d\n', t, n_sens, n_res, n_cd8);
+    end
+
+    if (n_sens + n_res) == 0
+        fprintf('Tumor extinct at step %d\n', t);
+        % break;   % uncomment if you want to stop when tumor is gone
+    end
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% 8) Visualization
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+    % ---- Left subplot: 3D spatial view ----
+    subplot(1,2,1); cla; hold on;
+
+    [x_s, y_s, z_s] = ind2sub(size(grid), find(grid == TUM_SENS));
+    [x_r, y_r, z_r] = ind2sub(size(grid), find(grid == TUM_RES));
+    [x_c, y_c, z_c] = ind2sub(size(grid), find(grid == CD8));
+
+    if ~isempty(x_s)
+        scatter3(x_s, y_s, z_s, 20, [1 0 0], 'filled');   % red: sensitive
+    end
+    if ~isempty(x_r)
+        scatter3(x_r, y_r, z_r, 20, [1 0 1], 'filled');   % magenta: resistant
+    end
+    if ~isempty(x_c)
+        scatter3(x_c, y_c, z_c, 10, [0 0 1], 'filled');   % blue: CD8
+    end
+
+    axis([1 N 1 N 1 N]); axis vis3d;
+    view(3);
+    xlabel('X'); ylabel('Y'); zlabel('Z');
+    title(sprintf('Step %d | sens=%d, res=%d', t, n_sens, n_res));
+
+    % ---- Right subplot: tumor burden over time ----
+subplot(1,2,2); cla; hold on;
+plot(1:t, tumor_total(1:t), 'k-', 'LineWidth', 2);
+plot(1:t, sens_hist(1:t),   'r-', 'LineWidth', 2);
+plot(1:t, res_hist(1:t),    'm-', 'LineWidth', 2);
+
+xlim([1 n_steps]);
+ylim([0 max([tumor_total; sens_hist; res_hist; 1])]);
+xlabel('Time step');
+ylabel('Number of tumor cells');
+title('Tumor burden over time');
+legend({'Total','Sensitive','Resistant'}, 'Location', 'northwest');
+grid on;
+
+    drawnow;
+
+end
+
+%=======================================
+% 9) Plot kill_sweeps history (AFTER simulation)
+%=======================================
+figure;
+plot(1:n_steps, kill_sweeps_hist, '-o');
+xlabel('Time step');
+ylabel('kill_sweeps');
+title(sprintf('CD8 killing strength over time (high=%d, low=%d, period=%d)', ...
+              kill_high, kill_low, switch_period));
+grid on;
