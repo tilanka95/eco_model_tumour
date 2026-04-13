@@ -1,5 +1,7 @@
 # 🧬 Eco-Evolutionary Tumour–Immune Simulation  
 ### Modelling Immunotherapy Resistance in Time and Space
+### tilanka95@g.skku.edu
+### tkdahanayake@jp.ac.lk
 
 ---
 
